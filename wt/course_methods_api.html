@@ -1,0 +1,332 @@
+<%
+
+//
+function assign_course(course_id)
+{
+    var duration = OptInt(RValue(OpenDoc(UrlFromDocID(Int(course_id))).TopElem.duration), 0);
+    if (duration == 0) duration = null;
+    tools.activate_course_to_person(curUserID, Int(course_id), null, null, null, duration);
+}
+
+//
+function get_course_launch_string(course_id, active_learning_id)
+{
+    return UrlAppendPath(global_settings.settings.portal_base_url, 'course_launch.html?course_id=' + course_id + '&object_id=' + active_learning_id + '&doc_id=&sid=' + tools_web.get_sum_sid(course_id, Session.sid));
+}
+
+//
+function get_course_info(course_id)
+{
+    var _learning = ArrayOptFirstElem(XQuery("sql: \n\
+        declare @course_id bigint = " + XQueryLiteral(course_id) + "; \n\
+        select \n\
+            crs.name, \n\
+            crs.resource_id img_id, \n\
+            al.id active_learning_id, \n\
+            convert(varchar, al.start_usage_date, 104) activation_date, \n\
+            convert(varchar, al.max_end_date, 104) max_end_date, \n\
+            al.score current_score, \n\
+            isnull(crs.duration, '-') as duration, \n\
+            crs.max_score \n\
+        from \n\
+            courses crs \n\
+            outer apply ( \n\
+                select top 1 \n\
+                    id, \n\
+                    start_usage_date, \n\
+                    max_end_date, \n\
+                    score \n\
+                from \n\
+                    active_learnings als \n\
+                where \n\
+                    als.course_id = @course_id \n\
+                    and cast(als.state_id as smallint) in (0, 1) \n\
+                    and als.person_id = " + curUserID + " \n\
+                order by als.creation_date desc \n\
+            ) al \n\
+        where \n\
+            crs.id = @course_id"
+	));
+
+    if (_learning == undefined)
+    {
+        throw UserError("Не найдено обучение");
+    }
+
+    var active_learning_id = RValue(_learning.active_learning_id);
+    var percent_score = 0;
+
+    if (!IsEmptyValue(active_learning_id))
+    {
+        if (RValue(_learning.current_score) != 0 && RValue(_learning.max_score) != 0)
+        {
+            try
+            {
+                percent_score = Math.ceil((OptReal(RValue(_learning.current_score), 0) / OptReal(RValue(_learning.max_score), 0)) * Real(100));
+            }
+            catch (_cant_calc_percent_score_)
+            {
+                percent_score = 0;
+            }
+        }
+    }
+
+    return {
+        active_learning_id: String(active_learning_id),
+        course_id: course_id,
+        name: RValue(_learning.name),
+        activation_date: RValue(_learning.activation_date),
+        max_end_date: RValue(_learning.max_end_date),
+        duration: RValue(_learning.duration),
+        img_id: String(RValue(_learning.img_id)),
+        max_score: String(RValue(_learning.max_score)),
+        current_score: String(RValue(_learning.current_score)),
+        percent_score: percent_score,
+        launch_str: (!IsEmptyValue(active_learning_id) ? get_course_launch_string(course_id, active_learning_id) : "")
+    }
+}
+
+//
+function get_courses_to_assign(search, page, _status, page_size)
+{
+    function extract_elem(elem)
+    {
+        return {
+            id: String(RValue(elem.id)),
+            name: RValue(elem.name),
+            can_assign: RValue(elem.can_assign)
+        }
+    }
+
+	var min = (page - 1) * page_size;
+	var max = min + page_size;
+
+    var status_condition = "";
+
+    if (!IsEmptyValue(_status))
+    {
+        status_condition = "and cs.status = " + XQueryLiteral(_status);
+    }
+
+    var _learnings = XQuery("sql: \n\
+        declare @search varchar(max) = " + XQueryLiteral(search) + "; \n\
+        select d.* \n\
+        from ( \n\
+            select \n\
+                c.*, \n\
+                row_number() over (order by c.name asc) as [row_number] \n\
+            from ( \n\
+                select \n\
+                    count(cs.id) over() total, \n\
+                    cs.id, \n\
+                    cs.name, \n\
+                    cast(case when ex.id is null then 1 else 0 end as bit) can_assign \n\
+                from \n\
+                    courses cs \n\
+                    outer apply ( \n\
+                        select top 1 \n\
+                            als.id \n\
+                        from \n\
+                            active_learnings als \n\
+                        where \n\
+                            cs.id = als.course_id \n\
+                            and als.person_id = " + curUserID + " \n\
+                            and cast(als.state_id as smallint) in (0, 1) \n\
+                    ) ex \n\
+                where \n\
+                    cs.name like '%'+@search+'%' \n\
+                    and cs.status != 'secret' \n\
+                    " + status_condition + " \n\
+            ) c \n\
+        ) d \n\
+        where \n\
+            d.[row_number] > " + min + " and d.[row_number] <= " + max + " \n\
+        order by d.name asc"
+	);
+
+    var total = 0;
+	var fobj = ArrayOptFirstElem(_learnings);
+
+	if (fobj != undefined)
+    {
+		total = RValue(fobj.total);
+	}
+
+	return {
+		total: Int(total),
+		page: page,
+		page_size: page_size,
+		min_row: min,
+		max_row: max,
+        list: ArrayExtract(_learnings, "extract_elem(This)")
+    }
+}
+
+//
+function get_my_courses(search, page, duration, page_size)
+{
+    function extract_elem(elem)
+    {
+        return {
+            id: String(RValue(elem.course_id)),
+            name: RValue(elem.course_name),
+            status: RValue(elem.status)
+        }
+    }
+
+	var min = (page - 1) * page_size;
+	var max = min + page_size;
+
+    var duration_condition = "";
+
+    if (duration == "empty")
+    {
+        duration_condition = "and isnull(al.data.value('(active_learning/duration)[1]', 'bigint'), 0) = 0";
+    }
+    else if (duration == "less")
+    {
+        duration_condition = "and al.data.value('(active_learning/duration)[1]', 'bigint') <= 10";
+    }
+    else if (duration == "more")
+    {
+        duration_condition = "and al.data.value('(active_learning/duration)[1]', 'bigint') > 10";
+    }
+
+    var _learnings = XQuery("sql: \n\
+        declare @search varchar(max) = " + XQueryLiteral(search) + "; \n\
+        select d.* \n\
+        from ( \n\
+            select \n\
+                c.*, \n\
+                row_number() over (order by c.course_name asc) as [row_number] \n\
+            from ( \n\
+                select \n\
+                    count(als.id) over() total, \n\
+                    als.course_id, \n\
+                    als.course_name, \n\
+                    lss.name status \n\
+                from \n\
+                    active_learnings als \n\
+                    inner join active_learning al \n\
+                        on als.id = al.id \n\
+                    inner join [common.learning_states] lss \n\
+                        on lss.id = als.state_id \n\
+                where \n\
+                    als.course_name like '%'+@search+'%' \n\
+                    and als.person_id = " + curUserID + " \n\
+                    " + duration_condition + " \n\
+            ) c \n\
+        ) d \n\
+        where \n\
+            d.[row_number] > " + min + " and d.[row_number] <= " + max + " \n\
+        order by d.course_name asc"
+	);
+
+    var total = 0;
+	var fobj = ArrayOptFirstElem(_learnings);
+
+	if (fobj != undefined)
+    {
+		total = RValue(fobj.total);
+	}
+
+	return {
+		total: Int(total),
+		page: page,
+		page_size: page_size,
+		min_row: min,
+		max_row: max,
+        list: ArrayExtract(_learnings, "extract_elem(This)")
+    }
+}
+
+
+//
+function send_response(data, code, message)
+{
+    var stringified = tools.object_to_text(data, "json");
+    var bin = new Binary();
+    bin.AssignStr(stringified);
+    Request.RespContentType = 'application/json; charset=utf-8';
+    Request.AddRespHeader('Content-Length', String(bin.Size));
+    Request.SetRespStatus(code, message);
+    Response.Write(stringified);
+}
+
+try
+{
+    var response = {
+        error: 0,
+        message: "",
+        result: null
+    }
+
+    var resp_status = 200;
+    var resp_message = "OK";
+
+    var method = Request.Method;
+    var action = Request.Query.GetOptProperty("action", "");
+
+    switch (method)
+    {
+        case "POST":
+            switch (action)
+            {
+                case "AssignCourse":
+                    var course_id = Request.Query.GetOptProperty("course_id", "");
+                    assign_course(course_id);
+                    break;
+                default:
+                    resp_status = 404;
+                    resp_message = "Not found";
+                    throw UserError("Method not found");
+            }
+            break;
+        case "GET":
+            switch (action)
+            {
+                case "MyCourses":
+                    var search = Request.Query.GetOptProperty("search", "");
+                    var page = Int(Request.Query.GetOptProperty("page", 1));
+                    var duration = Request.Query.GetOptProperty("duration", "");
+                    var page_size = Int(Request.Query.GetOptProperty("page_size", "10"));
+                    response.result = get_my_courses(search, page, duration, page_size);
+                    break;
+                case "Course":
+                    var course_id = Request.Query.GetOptProperty("course_id", "");
+                    response.result = get_course_info(course_id);
+                    break;
+                case "AvailibleCourses":
+                    var search = Request.Query.GetOptProperty("search", "");
+                    var page = Int(Request.Query.GetOptProperty("page", 1));
+                    var _status = Request.Query.GetOptProperty("status", "");
+                    var page_size = Int(Request.Query.GetOptProperty("page_size", "10"));
+                    response.result = get_courses_to_assign(search, page, _status, page_size);
+                    break;
+                default:
+                    resp_status = 404;
+                    resp_message = "Not found";
+                    throw UserError("Method not found");
+            }
+            break;
+        default:
+            resp_status = 404;
+            resp_message = "Not found";
+            throw UserError("Method not found");
+    }
+
+}
+catch (ex)
+{
+    alert(ex);
+    
+    response.error = 1;
+    resp_status = 500;
+    resp_message = "Server error";
+    response.message = ExtractUserError(ex);
+    response.result = null;
+}
+
+send_response(response, resp_status, resp_message);
+
+%>
